@@ -26,7 +26,12 @@ export const api = {
   deleteClient: (id: string) => apiRequest<void>(`/clients/${id}`, { method: 'DELETE' }),
 
   // Slots
-  getSlots: () => apiRequest<any[]>('/slots'),
+  getSlots: (params?: { from?: string; to?: string }) => {
+    const search = params?.from && params?.to
+      ? `?from=${encodeURIComponent(params.from)}&to=${encodeURIComponent(params.to)}`
+      : '';
+    return apiRequest<any[]>(`/slots${search}`);
+  },
   createSlot: (data: { date: string; time: string; available_formats: string }) =>
     apiRequest<any>('/slots', { method: 'POST', body: JSON.stringify(data) }),
   deleteSlot: (id: string) => apiRequest<void>(`/slots/${id}`, { method: 'DELETE' }),

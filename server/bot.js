@@ -31,6 +31,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 // Parse ADMIN_TELEGRAM_IDS from env (comma-separated string)
 const ADMIN_TELEGRAM_IDS_STR = process.env.ADMIN_TELEGRAM_IDS || '783321437,6933111964';
 const ADMIN_TELEGRAM_IDS = ADMIN_TELEGRAM_IDS_STR.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
+const ADMIN_GROUP_CHAT_ID = process.env.ADMIN_GROUP_CHAT_ID
+  ? parseInt(process.env.ADMIN_GROUP_CHAT_ID, 10)
+  : -1004479297213;
 
 function isAdmin(telegramId) {
   return ADMIN_TELEGRAM_IDS.includes(telegramId);
@@ -45,6 +48,7 @@ if (!TELEGRAM_BOT_TOKEN) {
 console.log('✓ Environment variables loaded');
 console.log('✓ Bot token:', TELEGRAM_BOT_TOKEN ? `${TELEGRAM_BOT_TOKEN.substring(0, 10)}...` : 'NOT SET');
 console.log('✓ Admin IDs:', ADMIN_TELEGRAM_IDS);
+console.log('✓ Admin group chat:', ADMIN_GROUP_CHAT_ID || 'not set');
 
 // Telegram API functions
 async function sendMessageToAllAdmins(text, replyMarkup = null) {
@@ -57,13 +61,17 @@ async function sendMessageToAllAdmins(text, replyMarkup = null) {
   return Promise.all(promises);
 }
 
-async function sendMessage(chatId, text, replyMarkup, useReplyKeyboard = true) {
+async function sendMessage(chatId, text, replyMarkup, useReplyKeyboard = true, messageThreadId = null) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
   };
+
+  if (messageThreadId != null) {
+    body.message_thread_id = messageThreadId;
+  }
 
   // Если передана инлайн-клавиатура, мы всё равно можем отправить reply_markup с кнопкой меню,
   // но Telegram позволяет только один тип клавиатуры в одном сообщении.
@@ -220,24 +228,145 @@ function looksLikeClientUuid(s) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 }
 
-async function notifyAdminsFirstBookingAccessRequest(clientRow) {
+function fbaTopicSettingKey(clientUuid) {
+  return `fba_topic_${clientUuid}`;
+}
+
+function fbaTopicLookupKey(groupChatId, threadId) {
+  return `fba_topic_lookup_${groupChatId}_${threadId}`;
+}
+
+function threadStateKey(chatId, threadId) {
+  return `state_${chatId}_${threadId}`;
+}
+
+async function getFbaTopicForClient(clientUuid) {
+  const setting = await db.getSetting(fbaTopicSettingKey(clientUuid));
+  if (!setting?.value) return null;
+  const value = typeof setting.value === 'string' ? JSON.parse(setting.value) : setting.value;
+  return value?.topicId ? value : null;
+}
+
+async function saveFbaTopicForClient(clientUuid, groupChatId, topicId) {
+  await db.setSetting(fbaTopicSettingKey(clientUuid), { groupChatId, topicId });
+  await db.setSetting(fbaTopicLookupKey(groupChatId, topicId), { clientUuid });
+}
+
+async function getClientUuidByFbaTopic(groupChatId, threadId) {
+  const setting = await db.getSetting(fbaTopicLookupKey(groupChatId, threadId));
+  if (!setting?.value) return null;
+  const value = typeof setting.value === 'string' ? JSON.parse(setting.value) : setting.value;
+  return value?.clientUuid || null;
+}
+
+async function getThreadState(chatId, threadId) {
+  const setting = await db.getSetting(threadStateKey(chatId, threadId));
+  return setting ? (typeof setting.value === 'string' ? JSON.parse(setting.value) : setting.value) : null;
+}
+
+async function setThreadState(chatId, threadId, state) {
+  await db.setSetting(threadStateKey(chatId, threadId), state);
+}
+
+async function clearThreadState(chatId, threadId) {
+  await db.query('DELETE FROM bot_settings WHERE key = $1', [threadStateKey(chatId, threadId)]);
+}
+
+async function createForumTopic(chatId, name) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createForumTopic`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      name: String(name).slice(0, 128),
+    }),
+  });
+  const result = await response.json();
+  if (!result.ok) {
+    console.error('❌ createForumTopic error:', JSON.stringify(result));
+    return null;
+  }
+  return result.result.message_thread_id;
+}
+
+function buildFirstBookingAccessAdminText(clientRow) {
   const name = clientRow.first_name || 'Клиент';
   const username = clientRow.username ? `@${clientRow.username}` : 'нет username';
   const lastName = clientRow.last_name ? ` ${clientRow.last_name}` : '';
-  const uuid = clientRow.id;
-  const text =
+  return (
     `📋 <b>Запрос на первую запись</b>\n\n` +
-    `Пользователь хочет записаться на консультацию (в истории ещё не было записей).\n\n` +
-    `👤 ${name}${lastName}\n${username}\n🆔 telegram id: <code>${clientRow.telegram_id}</code>`;
-  const replyMarkup = {
+    `Новый пользователь хочет записаться на консультацию.\n\n` +
+    `👤 ${name}${lastName}\n${username}\n🆔 telegram id: <code>${clientRow.telegram_id}</code>\n\n` +
+    `Используйте «Ответить», чтобы написать клиенту через бота, или «Одобрить запись», чтобы открыть самостоятельную запись.`
+  );
+}
+
+function buildFirstBookingAccessAdminKeyboard(clientUuid) {
+  return {
     inline_keyboard: [
       [
-        { text: '✅ Одобрить', callback_data: `fba_y_${uuid}` },
-        { text: '❌ Отклонить', callback_data: `fba_n_${uuid}` },
+        { text: '💬 Ответить', callback_data: `fba_reply_${clientUuid}` },
+        { text: '✅ Одобрить запись', callback_data: `fba_y_${clientUuid}` },
       ],
     ],
   };
+}
+
+async function ensureFbaAdminTopic(clientRow) {
+  if (!ADMIN_GROUP_CHAT_ID) return null;
+
+  const existing = await getFbaTopicForClient(clientRow.id);
+  if (existing?.topicId) {
+    return existing;
+  }
+
+  const name = clientRow.first_name || 'Клиент';
+  const username = clientRow.username ? `@${clientRow.username}` : `id ${clientRow.telegram_id}`;
+  const topicName = `${name} · ${username}`.slice(0, 128);
+  const topicId = await createForumTopic(ADMIN_GROUP_CHAT_ID, topicName);
+  if (!topicId) return null;
+
+  await saveFbaTopicForClient(clientRow.id, ADMIN_GROUP_CHAT_ID, topicId);
+  return { groupChatId: ADMIN_GROUP_CHAT_ID, topicId };
+}
+
+async function notifyAdminsFirstBookingAccessRequest(clientRow) {
+  const text = buildFirstBookingAccessAdminText(clientRow);
+  const replyMarkup = buildFirstBookingAccessAdminKeyboard(clientRow.id);
+
+  if (ADMIN_GROUP_CHAT_ID) {
+    const topic = await ensureFbaAdminTopic(clientRow);
+    if (topic) {
+      await sendMessage(
+        topic.groupChatId,
+        text,
+        replyMarkup,
+        false,
+        topic.topicId
+      );
+      return;
+    }
+    console.warn('⚠️ Failed to create forum topic, falling back to direct admin messages');
+  }
+
   await sendMessageToAllAdmins(text, replyMarkup);
+}
+
+async function relayClientMessageToFbaTopic(clientRow, text) {
+  const topic = await getFbaTopicForClient(clientRow.id);
+  if (!topic?.topicId) return false;
+
+  const name = clientRow.first_name || 'Клиент';
+  const username = clientRow.username ? `@${clientRow.username}` : 'нет username';
+  await sendMessage(
+    topic.groupChatId,
+    `👤 <b>Сообщение от клиента</b> (${name}, ${username}):\n\n${text}`,
+    buildFirstBookingAccessAdminKeyboard(clientRow.id),
+    false,
+    topic.topicId
+  );
+  return true;
 }
 
 async function getOrCreateClient(telegramUser) {
@@ -1095,7 +1224,59 @@ async function handleTextMessage(message, client) {
 
   if (text === '/cancel' && isAdmin(telegramId)) {
     await clearState(chatId);
+    if (message.message_thread_id && chatId === ADMIN_GROUP_CHAT_ID) {
+      await clearThreadState(chatId, message.message_thread_id);
+      await sendMessage(
+        chatId,
+        'Отменено.',
+        null,
+        false,
+        message.message_thread_id
+      );
+      return;
+    }
     await sendMessage(chatId, 'Отменено', getMainMenuKeyboard(telegramId));
+    return;
+  }
+
+  if (chatId === ADMIN_GROUP_CHAT_ID && message.message_thread_id && isAdmin(telegramId)) {
+    const threadId = message.message_thread_id;
+    const threadState = await getThreadState(chatId, threadId);
+
+    if (threadState?.state === 'waiting_fba_reply') {
+      const clientUuid = threadState.clientUuid;
+      if (!looksLikeClientUuid(clientUuid)) {
+        await clearThreadState(chatId, threadId);
+        return;
+      }
+      const targetClient = await db.getClientById(clientUuid);
+      if (!targetClient) {
+        await sendMessage(chatId, '❌ Клиент не найден.', null, false, threadId);
+        await clearThreadState(chatId, threadId);
+        return;
+      }
+
+      const adminName = message.from.first_name || 'Админ';
+      await sendMessage(
+        Number(targetClient.telegram_id),
+        `💬 <b>Сообщение от администратора:</b>\n\n${text}`,
+        getMainMenuKeyboard(Number(targetClient.telegram_id))
+      );
+      await sendMessage(
+        chatId,
+        `✅ <b>${adminName}</b>, сообщение отправлено клиенту.`,
+        buildFirstBookingAccessAdminKeyboard(clientUuid),
+        false,
+        threadId
+      );
+      await clearThreadState(chatId, threadId);
+      return;
+    }
+
+    return;
+  }
+
+  if (chatId === ADMIN_GROUP_CHAT_ID) {
     return;
   }
 
@@ -1170,6 +1351,37 @@ ${text}`;
       getMainMenuKeyboard(telegramId)
     );
     return;
+  }
+
+  const menuButtonTexts = new Set([
+    '📋 Главное меню',
+    '📋 Меню',
+    '🗓 Записаться на консультацию',
+    '📁 Свободные даты',
+    '🗓 Моя запись',
+    '📒 Дневник терапии',
+    '💳 Оплата',
+    '👤 Обо мне',
+    '🆘 SOS',
+  ]);
+
+  const freshClient = await db.getClientByTelegramId(telegramId);
+  if (
+    freshClient?.first_booking_access_requested_at &&
+    !freshClient.first_booking_access_approved &&
+    text &&
+    !text.startsWith('/') &&
+    !menuButtonTexts.has(text)
+  ) {
+    const relayed = await relayClientMessageToFbaTopic(freshClient, text);
+    if (relayed) {
+      await sendMessage(
+        chatId,
+        '✉️ Сообщение передано администратору. Ожидайте ответа.',
+        { inline_keyboard: [[{ text: '◀️ Назад', callback_data: 'main_menu' }]] }
+      );
+      return;
+    }
   }
 
   // Default response
@@ -1272,6 +1484,33 @@ async function handleCallbackQuery(callbackQuery, client) {
     return;
   }
 
+  if (data.startsWith('fba_reply_') && isAdmin(telegramId)) {
+    const clientUuid = data.slice('fba_reply_'.length);
+    if (!looksLikeClientUuid(clientUuid)) {
+      await sendMessage(chatId, 'Некорректная заявка.', null, false);
+      return;
+    }
+    const threadId = callbackQuery.message?.message_thread_id;
+    if (!threadId || chatId !== ADMIN_GROUP_CHAT_ID) {
+      await sendMessage(chatId, 'Ответить можно только из темы заявки в админ-чате.', null, false);
+      return;
+    }
+    await setThreadState(chatId, threadId, {
+      state: 'waiting_fba_reply',
+      clientUuid,
+      adminTelegramId: telegramId,
+    });
+    const adminName = callbackQuery.from.first_name || 'Админ';
+    await sendMessage(
+      chatId,
+      `✍️ <b>${adminName}</b>, напишите сообщение в этой теме — бот перешлёт его клиенту.\n\nДля отмены: /cancel`,
+      null,
+      false,
+      threadId
+    );
+    return;
+  }
+
   if ((data.startsWith('fba_y_') || data.startsWith('fba_n_')) && isAdmin(telegramId)) {
     const clientUuid = data.slice(6);
     const approve = data.startsWith('fba_y_');
@@ -1282,9 +1521,14 @@ async function handleCallbackQuery(callbackQuery, client) {
     const msg = callbackQuery.message;
     const adminMsgChatId = msg?.chat?.id;
     const adminMsgId = msg?.message_id;
+    const threadId = msg?.message_thread_id;
+    const adminName = callbackQuery.from.first_name || 'Админ';
     if (approve) {
       const row = await db.approveClientFirstBookingAccess(clientUuid);
       if (row) {
+        if (threadId) {
+          await clearThreadState(adminMsgChatId, threadId);
+        }
         if (adminMsgChatId != null && adminMsgId != null) {
           await editMessageReplyMarkup(adminMsgChatId, adminMsgId, { inline_keyboard: [] });
         }
@@ -1294,13 +1538,26 @@ async function handleCallbackQuery(callbackQuery, client) {
           '✅ <b>Заявка одобрена.</b>\n\nТеперь вы можете открыть «Записаться на консультацию» и выбрать дату и время.',
           getMainMenuKeyboard(clientTg)
         );
-        await sendMessage(chatId, '✅ Доступ к самостоятельной записи предоставлен.', null, false);
+        if (threadId && adminMsgChatId === ADMIN_GROUP_CHAT_ID) {
+          await sendMessage(
+            adminMsgChatId,
+            `✅ <b>${adminName}</b> одобрил(а) запись клиенту.`,
+            null,
+            false,
+            threadId
+          );
+        } else {
+          await sendMessage(chatId, '✅ Доступ к самостоятельной записи предоставлен.', null, false);
+        }
       } else {
         await sendMessage(chatId, 'Заявка уже обработана или клиент не найден.', null, false);
       }
     } else {
       const row = await db.rejectClientFirstBookingAccess(clientUuid);
       if (row) {
+        if (threadId) {
+          await clearThreadState(adminMsgChatId, threadId);
+        }
         if (adminMsgChatId != null && adminMsgId != null) {
           await editMessageReplyMarkup(adminMsgChatId, adminMsgId, { inline_keyboard: [] });
         }
@@ -1310,7 +1567,17 @@ async function handleCallbackQuery(callbackQuery, client) {
           '❌ <b>Заявка на запись отклонена.</b>\n\nЕсли это ошибка, свяжитесь с администратором.',
           getMainMenuKeyboard(clientTg)
         );
-        await sendMessage(chatId, 'Заявка отклонена.', null, false);
+        if (threadId && adminMsgChatId === ADMIN_GROUP_CHAT_ID) {
+          await sendMessage(
+            adminMsgChatId,
+            `❌ <b>${adminName}</b> отклонил(а) заявку.`,
+            null,
+            false,
+            threadId
+          );
+        } else {
+          await sendMessage(chatId, 'Заявка отклонена.', null, false);
+        }
       } else {
         await sendMessage(chatId, 'Нечего отклонять или заявка уже обработана.', null, false);
       }
@@ -1833,9 +2100,19 @@ ${name}, к сожалению, ваша консультация на ${formatD
   }
 });
 
-// GET /api/slots - Get all slots (only future slots)
+// GET /api/slots - Get slots (future by default, or ?from=&to= for a date range)
 app.get('/api/slots', async (req, res) => {
   try {
+    const { from, to } = req.query;
+    if (from && to) {
+      const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+      if (!datePattern.test(String(from)) || !datePattern.test(String(to))) {
+        return res.status(400).json({ error: 'from and to must be YYYY-MM-DD' });
+      }
+      const slots = await db.getSlotsByDateRange(from, to);
+      return res.json(slots);
+    }
+
     const today = new Date().toISOString().split('T')[0];
     const slots = await db.getSlots(today);
     res.json(slots);

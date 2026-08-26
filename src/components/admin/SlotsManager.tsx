@@ -9,9 +9,10 @@ import { Calendar } from "@/components/ui/calendar";
 import { Badge } from "@/components/ui/badge";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { Plus, Trash2, CalendarIcon, Clock, ExternalLink, RotateCcw, FileText, RefreshCw } from "lucide-react";
-import { format } from "date-fns";
+import { Plus, Trash2, CalendarIcon, Clock, ExternalLink, RotateCcw, FileText, RefreshCw, History } from "lucide-react";
+import { format, startOfMonth, endOfMonth, subMonths } from "date-fns";
 import { ru } from "date-fns/locale";
 
 interface Slot {
@@ -46,6 +47,31 @@ const weekDaysNames: Record<string, string> = {
   sunday: "Воскресенье",
 };
 
+function mapApiSlots(data: any[]): Slot[] {
+  return data.map((slot: any) => ({
+    ...slot,
+    clients: slot.first_name || slot.last_name || slot.username ? {
+      first_name: slot.first_name,
+      last_name: slot.last_name,
+      username: slot.username,
+      telegram_id: slot.telegram_id,
+    } : null,
+  })) as Slot[];
+}
+
+function groupSlotsByDate(slots: Slot[]) {
+  return slots.reduce((acc, slot) => {
+    if (!acc[slot.date]) acc[slot.date] = [];
+    acc[slot.date].push(slot);
+    return acc;
+  }, {} as Record<string, Slot[]>);
+}
+
+const previousMonthDate = subMonths(new Date(), 1);
+const previousMonthFrom = format(startOfMonth(previousMonthDate), "yyyy-MM-dd");
+const previousMonthTo = format(endOfMonth(previousMonthDate), "yyyy-MM-dd");
+const previousMonthLabel = format(previousMonthDate, "LLLL yyyy", { locale: ru });
+
 const SlotsManager = () => {
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -54,21 +80,19 @@ const SlotsManager = () => {
   const [newSlotFormats, setNewSlotFormats] = useState<"offline" | "online" | "both">("both");
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [weeksToApply, setWeeksToApply] = useState("1");
+  const [scheduleTab, setScheduleTab] = useState("current");
 
   const { data: slots = [], isLoading } = useQuery({
     queryKey: ["slots"],
-    queryFn: async () => {
-      const data = await api.getSlots();
-      return data.map((slot: any) => ({
-        ...slot,
-        clients: slot.first_name || slot.last_name || slot.username ? {
-          first_name: slot.first_name,
-          last_name: slot.last_name,
-          username: slot.username,
-          telegram_id: slot.telegram_id,
-        } : null,
-      })) as Slot[];
-    },
+    queryFn: async () => mapApiSlots(await api.getSlots()),
+  });
+
+  const { data: pastMonthSlots = [], isLoading: isLoadingPastMonth } = useQuery({
+    queryKey: ["slots", "previous-month", previousMonthFrom, previousMonthTo],
+    queryFn: async () => mapApiSlots(
+      await api.getSlots({ from: previousMonthFrom, to: previousMonthTo })
+    ),
+    enabled: scheduleTab === "previous",
   });
 
   const { data: template, isLoading: isLoadingTemplate } = useQuery({
@@ -178,11 +202,112 @@ const SlotsManager = () => {
   }
 
   // Group slots by date
-  const slotsByDate = slots.reduce((acc, slot) => {
-    if (!acc[slot.date]) acc[slot.date] = [];
-    acc[slot.date].push(slot);
-    return acc;
-  }, {} as Record<string, Slot[]>);
+  const slotsByDate = groupSlotsByDate(slots);
+  const pastBookings = pastMonthSlots.filter((slot) => slot.status === "booked");
+  const pastBookingsByDate = groupSlotsByDate(pastBookings);
+
+  const renderSlotRow = (slot: Slot, readOnly = false) => {
+    const fullName = [slot.clients?.first_name, slot.clients?.last_name]
+      .filter(Boolean)
+      .join(" ") || slot.clients?.username || "Клиент";
+    const formatLabel = slot.format === "online" ? "💻" : "🏠";
+
+    return (
+      <div
+        key={slot.id}
+        className="flex items-center justify-between p-3 rounded-lg border border-border bg-card hover:bg-accent/50 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <span className="font-medium">{slot.time.slice(0, 5)}</span>
+          {slot.status === "booked" ? (
+            <>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Badge variant="secondary" className="flex items-center gap-1">
+                  {formatLabel} {fullName}
+                </Badge>
+                {slot.comment === 'Регулярный клиент' && (
+                  <Badge variant="outline" className="text-xs bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950 dark:text-blue-300 dark:border-blue-800">
+                    Регулярный
+                  </Badge>
+                )}
+              </div>
+              {slot.clients?.telegram_id && (
+                <a
+                  href={`https://t.me/${slot.clients.username || ''}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:text-primary/80 transition-colors"
+                  title="Открыть чат в Telegram"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                </a>
+              )}
+            </>
+          ) : (
+            <>
+              <Badge variant="outline" className="text-success border-success">
+                Свободно
+              </Badge>
+              <span className="text-xs text-muted-foreground">
+                {slot.available_formats === "both" ? "🏠💻" : slot.available_formats === "offline" ? "🏠" : "💻"}
+              </span>
+            </>
+          )}
+        </div>
+        {!readOnly && (
+          <div className="flex items-center gap-2">
+            {slot.status === "booked" && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => cancelBookingMutation.mutate(slot.id)}
+                disabled={cancelBookingMutation.isPending}
+                title="Отменить запись"
+              >
+                <Trash2 className="h-4 w-4 text-destructive" />
+              </Button>
+            )}
+            {slot.status === "free" && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => deleteSlotMutation.mutate(slot.id)}
+                disabled={deleteSlotMutation.isPending}
+                title="Удалить слот"
+              >
+                <Trash2 className="h-4 w-4 text-destructive" />
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderScheduleByDate = (
+    slotsGrouped: Record<string, Slot[]>,
+    readOnly = false,
+    emptyMessage: string
+  ) => {
+    if (Object.keys(slotsGrouped).length === 0) {
+      return <p className="text-muted-foreground">{emptyMessage}</p>;
+    }
+
+    return (
+      <div className="space-y-6">
+        {Object.entries(slotsGrouped).map(([date, daySlots]) => (
+          <div key={date}>
+            <h3 className="font-medium text-foreground mb-3">
+              {format(new Date(date), "EEEE, d MMMM", { locale: ru })}
+            </h3>
+            <div className="space-y-2">
+              {daySlots.map((slot) => renderSlotRow(slot, readOnly))}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -358,101 +483,43 @@ const SlotsManager = () => {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
-            <p className="text-muted-foreground">Загрузка...</p>
-          ) : Object.keys(slotsByDate).length === 0 ? (
-            <p className="text-muted-foreground">Нет слотов</p>
-          ) : (
-            <div className="space-y-6">
-              {Object.entries(slotsByDate).map(([date, daySlots]) => (
-                <div key={date}>
-                  <h3 className="font-medium text-foreground mb-3">
-                    {format(new Date(date), "EEEE, d MMMM", { locale: ru })}
-                  </h3>
-                  <div className="space-y-2">
-                    {daySlots.map((slot) => {
-                      const fullName = [slot.clients?.first_name, slot.clients?.last_name]
-                        .filter(Boolean)
-                        .join(" ") || slot.clients?.username || "Клиент";
-                      const telegramLink = slot.clients?.telegram_id
-                        ? `https://t.me/${slot.clients.username || ''}`.replace('https://t.me/', `tg://user?id=${slot.clients.telegram_id}`)
-                        : null;
-                      const formatLabel = slot.format === "online" ? "💻" : "🏠";
+          <Tabs value={scheduleTab} onValueChange={setScheduleTab}>
+            <TabsList className="mb-4">
+              <TabsTrigger value="current" className="gap-2">
+                <Clock className="h-4 w-4" />
+                Текущее
+              </TabsTrigger>
+              <TabsTrigger value="previous" className="gap-2">
+                <History className="h-4 w-4" />
+                {previousMonthLabel}
+              </TabsTrigger>
+            </TabsList>
 
-                      return (
-                        <div
-                          key={slot.id}
-                          className="flex items-center justify-between p-3 rounded-lg border border-border bg-card hover:bg-accent/50 transition-colors"
-                        >
-                          <div className="flex items-center gap-3">
-                            <span className="font-medium">{slot.time.slice(0, 5)}</span>
-                            {slot.status === "booked" ? (
-                              <>
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <Badge variant="secondary" className="flex items-center gap-1">
-                                    {formatLabel} {fullName}
-                                  </Badge>
-                                  {slot.comment === 'Регулярный клиент' && (
-                                    <Badge variant="outline" className="text-xs bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950 dark:text-blue-300 dark:border-blue-800">
-                                      Регулярный
-                                    </Badge>
-                                  )}
-                                </div>
-                                {slot.clients?.telegram_id && (
-                                  <a
-                                    href={`https://t.me/${slot.clients.username || ''}`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-primary hover:text-primary/80 transition-colors"
-                                    title="Открыть чат в Telegram"
-                                  >
-                                    <ExternalLink className="h-4 w-4" />
-                                  </a>
-                                )}
-                              </>
-                            ) : (
-                              <>
-                                <Badge variant="outline" className="text-success border-success">
-                                  Свободно
-                                </Badge>
-                                <span className="text-xs text-muted-foreground">
-                                  {slot.available_formats === "both" ? "🏠💻" : slot.available_formats === "offline" ? "🏠" : "💻"}
-                                </span>
-                              </>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-2">
-                            {slot.status === "booked" && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => cancelBookingMutation.mutate(slot.id)}
-                                disabled={cancelBookingMutation.isPending}
-                                title="Отменить запись"
-                              >
-                                <Trash2 className="h-4 w-4 text-destructive" />
-                              </Button>
-                            )}
-                            {slot.status === "free" && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => deleteSlotMutation.mutate(slot.id)}
-                                disabled={deleteSlotMutation.isPending}
-                                title="Удалить слот"
-                              >
-                                <Trash2 className="h-4 w-4 text-destructive" />
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+            <TabsContent value="current">
+              {isLoading ? (
+                <p className="text-muted-foreground">Загрузка...</p>
+              ) : (
+                renderScheduleByDate(slotsByDate, false, "Нет слотов")
+              )}
+            </TabsContent>
+
+            <TabsContent value="previous">
+              {isLoadingPastMonth ? (
+                <p className="text-muted-foreground">Загрузка...</p>
+              ) : (
+                <>
+                  <p className="text-sm text-muted-foreground mb-4">
+                    Записи за {previousMonthLabel}: {pastBookings.length}
+                  </p>
+                  {renderScheduleByDate(
+                    pastBookingsByDate,
+                    true,
+                    `За ${previousMonthLabel} записей нет`
+                  )}
+                </>
+              )}
+            </TabsContent>
+          </Tabs>
         </CardContent>
       </Card>
     </div>

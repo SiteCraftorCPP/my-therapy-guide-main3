@@ -270,6 +270,19 @@ async function getSlots(cutoffDate) {
   return result.rows;
 }
 
+async function getSlotsByDateRange(fromDate, toDate) {
+  const result = await query(
+    `SELECT s.*, 
+       c.first_name, c.last_name, c.username, c.telegram_id
+     FROM slots s
+     LEFT JOIN clients c ON s.client_id = c.id
+     WHERE s.date >= $1::date AND s.date <= $2::date
+     ORDER BY s.date DESC, s.time ASC`,
+    [fromDate, toDate]
+  );
+  return result.rows;
+}
+
 // Booking operations
 async function getClientBookings(clientId) {
   const result = await query(
@@ -479,6 +492,7 @@ module.exports = {
   createSlot,
   deleteSlot,
   getSlots,
+  getSlotsByDateRange,
   // Booking
   getClientBookings,
   getBookingBySlotId,
