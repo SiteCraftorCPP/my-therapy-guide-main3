@@ -104,6 +104,29 @@ function isAdmin(telegramId) {
   return ADMIN_TELEGRAM_IDS.includes(telegramId);
 }
 
+async function getChatMemberStatus(chatId, userId) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChatMember`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: String(chatId), user_id: Number(userId) }),
+  });
+  const result = await response.json();
+  if (!result.ok) {
+    console.warn('getChatMember failed:', JSON.stringify(result), { chatId, userId });
+    return null;
+  }
+  return result.result?.status || null;
+}
+
+/** Админ из .env или администратор/создатель в группе заявок. */
+async function canManageGroupBooking(chatId, telegramId) {
+  if (isAdmin(telegramId)) return true;
+  if (!isAdminGroupChat(chatId)) return false;
+  const status = await getChatMemberStatus(chatId, telegramId);
+  return status === 'creator' || status === 'administrator';
+}
+
 // Validate environment variables
 if (!TELEGRAM_BOT_TOKEN) {
   console.error('ERROR: TELEGRAM_BOT_TOKEN is not set!');
@@ -1296,7 +1319,7 @@ async function handleTextMessage(message, client) {
     return;
   }
 
-  if (text === '/cancel' && isAdmin(telegramId)) {
+  if (text === '/cancel' && await canManageGroupBooking(chatId, telegramId)) {
     await clearState(chatId);
     if (message.message_thread_id && isAdminGroupChat(chatId)) {
       await clearThreadState(chatId, message.message_thread_id);
@@ -1313,7 +1336,7 @@ async function handleTextMessage(message, client) {
     return;
   }
 
-  if (isAdminGroupChat(chatId) && message.message_thread_id && isAdmin(telegramId)) {
+  if (isAdminGroupChat(chatId) && message.message_thread_id && await canManageGroupBooking(chatId, telegramId)) {
     const threadId = message.message_thread_id;
     const threadState = await getThreadState(chatId, threadId);
 
@@ -1585,13 +1608,23 @@ async function handleCallbackQuery(callbackQuery, client) {
     return;
   }
 
-  if (data.startsWith('fba_reply_') && isAdmin(telegramId)) {
-    const clientUuid = data.slice('fba_reply_'.length);
-    if (!looksLikeClientUuid(clientUuid)) {
-      await sendMessage(chatId, 'Некорректная заявка.', null, false);
+  if (data.startsWith('fba_reply_')) {
+    const threadId = callbackQuery.message?.message_thread_id;
+    if (!(await canManageGroupBooking(chatId, telegramId))) {
+      await sendMessage(
+        chatId,
+        'Это действие доступно только администратору группы.',
+        null,
+        false,
+        threadId || undefined
+      );
       return;
     }
-    const threadId = callbackQuery.message?.message_thread_id;
+    const clientUuid = data.slice('fba_reply_'.length);
+    if (!looksLikeClientUuid(clientUuid)) {
+      await sendMessage(chatId, 'Некорректная заявка.', null, false, threadId || undefined);
+      return;
+    }
     if (!threadId || !isAdminGroupChat(chatId)) {
       await sendMessage(chatId, 'Ответить можно только из темы заявки в админ-чате.', null, false);
       return;
@@ -1612,7 +1645,18 @@ async function handleCallbackQuery(callbackQuery, client) {
     return;
   }
 
-  if ((data.startsWith('fba_y_') || data.startsWith('fba_n_')) && isAdmin(telegramId)) {
+  if (data.startsWith('fba_y_') || data.startsWith('fba_n_')) {
+    const threadId = callbackQuery.message?.message_thread_id;
+    if (!(await canManageGroupBooking(chatId, telegramId))) {
+      await sendMessage(
+        chatId,
+        'Это действие доступно только администратору группы.',
+        null,
+        false,
+        threadId || undefined
+      );
+      return;
+    }
     const clientUuid = data.slice(6);
     const approve = data.startsWith('fba_y_');
     if (!looksLikeClientUuid(clientUuid)) {
@@ -1622,7 +1666,6 @@ async function handleCallbackQuery(callbackQuery, client) {
     const msg = callbackQuery.message;
     const adminMsgChatId = msg?.chat?.id;
     const adminMsgId = msg?.message_id;
-    const threadId = msg?.message_thread_id;
     const adminName = callbackQuery.from.first_name || 'Админ';
     if (approve) {
       const row = await db.approveClientFirstBookingAccess(clientUuid);
@@ -1683,11 +1726,6 @@ async function handleCallbackQuery(callbackQuery, client) {
         await sendMessage(chatId, 'Нечего отклонять или заявка уже обработана.', null, false);
       }
     }
-    return;
-  }
-
-  if ((data.startsWith('fba_y_') || data.startsWith('fba_n_')) && !isAdmin(telegramId)) {
-    await sendMessage(chatId, 'Эти действия доступны только администратору.', null, false);
     return;
   }
 
