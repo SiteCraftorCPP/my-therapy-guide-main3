@@ -82,7 +82,10 @@ async function loadAdminGroupChatId() {
   const fromEnv = process.env.ADMIN_GROUP_CHAT_ID?.trim();
   if (fromEnv) {
     adminGroupChatId = fromEnv;
-    if (await validateAdminGroupChat()) return;
+    if (await validateAdminGroupChat()) {
+      await db.setSetting('admin_group_chat_id', { chatId: adminGroupChatId });
+      return;
+    }
     console.warn('⚠️ ADMIN_GROUP_CHAT_ID from .env is invalid, trying DB...');
   }
   const setting = await db.getSetting('admin_group_chat_id');
@@ -349,7 +352,7 @@ async function createForumTopic(chatId, name) {
   });
   const result = await response.json();
   if (!result.ok) {
-    console.error('❌ createForumTopic error:', JSON.stringify(result));
+    console.error('❌ createForumTopic error:', JSON.stringify(result), 'chat_id=', String(chatId));
     return null;
   }
   return result.result.message_thread_id;
