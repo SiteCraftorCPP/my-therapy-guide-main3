@@ -29,11 +29,73 @@ app.use((req, res, next) => {
 // Configuration
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 // Parse ADMIN_TELEGRAM_IDS from env (comma-separated string)
-const ADMIN_TELEGRAM_IDS_STR = process.env.ADMIN_TELEGRAM_IDS || '783321437,6933111964';
-const ADMIN_TELEGRAM_IDS = ADMIN_TELEGRAM_IDS_STR.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
-const ADMIN_GROUP_CHAT_ID = process.env.ADMIN_GROUP_CHAT_ID
-  ? parseInt(process.env.ADMIN_GROUP_CHAT_ID, 10)
-  : -1004479297213;
+const ADMIN_TELEGRAM_IDS_STR = process.env.ADMIN_TELEGRAM_IDS || '';
+const ADMIN_TELEGRAM_IDS = ADMIN_TELEGRAM_IDS_STR.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+let adminGroupChatId = process.env.ADMIN_GROUP_CHAT_ID?.trim() || null;
+
+function getAdminGroupChatId() {
+  return adminGroupChatId;
+}
+
+function isAdminGroupChat(chatId) {
+  const groupId = getAdminGroupChatId();
+  return groupId != null && String(chatId) === groupId;
+}
+
+async function telegramGetChat(chatId) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChat`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: String(chatId) }),
+  });
+  return response.json();
+}
+
+async function validateAdminGroupChat() {
+  const id = getAdminGroupChatId();
+  if (!id) {
+    console.warn('⚠️ Admin group chat not configured');
+    return false;
+  }
+  const chat = await telegramGetChat(id);
+  if (!chat?.ok) {
+    console.error('❌ Admin group chat not reachable:', id, JSON.stringify(chat));
+    return false;
+  }
+  const info = chat.result;
+  console.log(`✓ Admin group chat: ${info.title} (${id}), forum=${info.is_forum}`);
+  if (!info.is_forum) {
+    console.error('❌ Admin group must have Topics (forum) enabled');
+    return false;
+  }
+  return true;
+}
+
+async function registerAdminGroupChat(chatId, title) {
+  adminGroupChatId = String(chatId);
+  await db.setSetting('admin_group_chat_id', { chatId: adminGroupChatId, title: title || null });
+  return validateAdminGroupChat();
+}
+
+async function loadAdminGroupChatId() {
+  const fromEnv = process.env.ADMIN_GROUP_CHAT_ID?.trim();
+  if (fromEnv) {
+    adminGroupChatId = fromEnv;
+    if (await validateAdminGroupChat()) return;
+    console.warn('⚠️ ADMIN_GROUP_CHAT_ID from .env is invalid, trying DB...');
+  }
+  const setting = await db.getSetting('admin_group_chat_id');
+  if (setting?.value) {
+    const value = typeof setting.value === 'string' ? JSON.parse(setting.value) : setting.value;
+    if (value?.chatId) {
+      adminGroupChatId = String(value.chatId);
+      if (await validateAdminGroupChat()) return;
+    }
+  }
+  adminGroupChatId = null;
+  console.warn('⚠️ Admin group chat not configured. Add bot to forum group or send /set_admin_group there.');
+}
 
 function isAdmin(telegramId) {
   return ADMIN_TELEGRAM_IDS.includes(telegramId);
@@ -48,11 +110,14 @@ if (!TELEGRAM_BOT_TOKEN) {
 console.log('✓ Environment variables loaded');
 console.log('✓ Bot token:', TELEGRAM_BOT_TOKEN ? `${TELEGRAM_BOT_TOKEN.substring(0, 10)}...` : 'NOT SET');
 console.log('✓ Admin IDs:', ADMIN_TELEGRAM_IDS);
-console.log('✓ Admin group chat:', ADMIN_GROUP_CHAT_ID || 'not set');
+console.log('✓ Admin group chat:', getAdminGroupChatId() || 'not set (will load from DB on start)');
 
 // Telegram API functions
-async function sendMessageToAllAdmins(text, replyMarkup = null) {
-  const promises = ADMIN_TELEGRAM_IDS.map(adminId =>
+async function sendMessageToAllAdmins(text, replyMarkup = null, excludeTelegramId = null) {
+  const adminIds = excludeTelegramId == null
+    ? ADMIN_TELEGRAM_IDS
+    : ADMIN_TELEGRAM_IDS.filter((id) => id !== excludeTelegramId);
+  const promises = adminIds.map(adminId =>
     sendMessage(adminId, text, replyMarkup, false).catch(error => {
       console.error(`❌ Error sending message to admin ${adminId}:`, error);
       return null;
@@ -278,7 +343,7 @@ async function createForumTopic(chatId, name) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      chat_id: chatId,
+      chat_id: String(chatId),
       name: String(name).slice(0, 128),
     }),
   });
@@ -314,7 +379,8 @@ function buildFirstBookingAccessAdminKeyboard(clientUuid) {
 }
 
 async function ensureFbaAdminTopic(clientRow) {
-  if (!ADMIN_GROUP_CHAT_ID) return null;
+  const groupChatId = getAdminGroupChatId();
+  if (!groupChatId) return null;
 
   const existing = await getFbaTopicForClient(clientRow.id);
   if (existing?.topicId) {
@@ -324,18 +390,20 @@ async function ensureFbaAdminTopic(clientRow) {
   const name = clientRow.first_name || 'Клиент';
   const username = clientRow.username ? `@${clientRow.username}` : `id ${clientRow.telegram_id}`;
   const topicName = `${name} · ${username}`.slice(0, 128);
-  const topicId = await createForumTopic(ADMIN_GROUP_CHAT_ID, topicName);
+  const topicId = await createForumTopic(groupChatId, topicName);
   if (!topicId) return null;
 
-  await saveFbaTopicForClient(clientRow.id, ADMIN_GROUP_CHAT_ID, topicId);
-  return { groupChatId: ADMIN_GROUP_CHAT_ID, topicId };
+  await saveFbaTopicForClient(clientRow.id, groupChatId, topicId);
+  return { groupChatId, topicId };
 }
 
 async function notifyAdminsFirstBookingAccessRequest(clientRow) {
   const text = buildFirstBookingAccessAdminText(clientRow);
   const replyMarkup = buildFirstBookingAccessAdminKeyboard(clientRow.id);
+  const clientTelegramId = Number(clientRow.telegram_id);
 
-  if (ADMIN_GROUP_CHAT_ID) {
+  const groupChatId = getAdminGroupChatId();
+  if (groupChatId) {
     const topic = await ensureFbaAdminTopic(clientRow);
     if (topic) {
       await sendMessage(
@@ -345,12 +413,15 @@ async function notifyAdminsFirstBookingAccessRequest(clientRow) {
         false,
         topic.topicId
       );
+      console.log('✅ First booking request sent to admin group topic:', topic.topicId);
       return;
     }
-    console.warn('⚠️ Failed to create forum topic, falling back to direct admin messages');
+    console.error('❌ Failed to create forum topic in group', groupChatId, '- check bot permissions and forum mode');
+  } else {
+    console.error('❌ Admin group chat not configured - cannot create booking topic');
   }
 
-  await sendMessageToAllAdmins(text, replyMarkup);
+  await sendMessageToAllAdmins(text, replyMarkup, clientTelegramId);
 }
 
 async function relayClientMessageToFbaTopic(clientRow, text) {
@@ -1224,7 +1295,7 @@ async function handleTextMessage(message, client) {
 
   if (text === '/cancel' && isAdmin(telegramId)) {
     await clearState(chatId);
-    if (message.message_thread_id && chatId === ADMIN_GROUP_CHAT_ID) {
+    if (message.message_thread_id && isAdminGroupChat(chatId)) {
       await clearThreadState(chatId, message.message_thread_id);
       await sendMessage(
         chatId,
@@ -1239,7 +1310,7 @@ async function handleTextMessage(message, client) {
     return;
   }
 
-  if (chatId === ADMIN_GROUP_CHAT_ID && message.message_thread_id && isAdmin(telegramId)) {
+  if (isAdminGroupChat(chatId) && message.message_thread_id && isAdmin(telegramId)) {
     const threadId = message.message_thread_id;
     const threadState = await getThreadState(chatId, threadId);
 
@@ -1276,7 +1347,34 @@ async function handleTextMessage(message, client) {
     return;
   }
 
-  if (chatId === ADMIN_GROUP_CHAT_ID) {
+  if (text === '/set_admin_group' && isAdmin(telegramId)) {
+    const chatType = message.chat?.type;
+    if (chatType !== 'supergroup' && chatType !== 'group') {
+      await sendMessage(chatId, 'Команду нужно отправить в группе админов с включёнными темами.', null, false);
+      return;
+    }
+    const ok = await registerAdminGroupChat(chatId, message.chat.title);
+    if (ok) {
+      await sendMessage(
+        chatId,
+        `✅ Группа зарегистрирована: <b>${message.chat.title || 'без названия'}</b>\nID: <code>${chatId}</code>\n\nНовые заявки на запись будут создавать темы здесь.`,
+        null,
+        false,
+        message.message_thread_id || undefined
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        '❌ Не удалось зарегистрировать группу. Включите темы (forum) и дайте боту право «Управление темами».',
+        null,
+        false,
+        message.message_thread_id || undefined
+      );
+    }
+    return;
+  }
+
+  if (isAdminGroupChat(chatId)) {
     return;
   }
 
@@ -1491,7 +1589,7 @@ async function handleCallbackQuery(callbackQuery, client) {
       return;
     }
     const threadId = callbackQuery.message?.message_thread_id;
-    if (!threadId || chatId !== ADMIN_GROUP_CHAT_ID) {
+    if (!threadId || !isAdminGroupChat(chatId)) {
       await sendMessage(chatId, 'Ответить можно только из темы заявки в админ-чате.', null, false);
       return;
     }
@@ -1538,7 +1636,7 @@ async function handleCallbackQuery(callbackQuery, client) {
           '✅ <b>Заявка одобрена.</b>\n\nТеперь вы можете открыть «Записаться на консультацию» и выбрать дату и время.',
           getMainMenuKeyboard(clientTg)
         );
-        if (threadId && adminMsgChatId === ADMIN_GROUP_CHAT_ID) {
+        if (threadId && isAdminGroupChat(adminMsgChatId)) {
           await sendMessage(
             adminMsgChatId,
             `✅ <b>${adminName}</b> одобрил(а) запись клиенту.`,
@@ -1567,7 +1665,7 @@ async function handleCallbackQuery(callbackQuery, client) {
           '❌ <b>Заявка на запись отклонена.</b>\n\nЕсли это ошибка, свяжитесь с администратором.',
           getMainMenuKeyboard(clientTg)
         );
-        if (threadId && adminMsgChatId === ADMIN_GROUP_CHAT_ID) {
+        if (threadId && isAdminGroupChat(adminMsgChatId)) {
           await sendMessage(
             adminMsgChatId,
             `❌ <b>${adminName}</b> отклонил(а) заявку.`,
@@ -1674,6 +1772,21 @@ app.post('/webhook', async (req, res) => {
       callbackData: update.callback_query?.data,
       messageText: update.message?.text
     });
+
+    if (update.my_chat_member) {
+      const mcm = update.my_chat_member;
+      const member = mcm.new_chat_member;
+      const chat = mcm.chat;
+      if (
+        member?.is_bot &&
+        ['member', 'administrator'].includes(member.status) &&
+        chat?.type === 'supergroup' &&
+        chat.is_forum
+      ) {
+        console.log('🤖 Bot added to forum group:', chat.id, chat.title);
+        await registerAdminGroupChat(chat.id, chat.title);
+      }
+    }
 
     if (update.message) {
       const client = await getOrCreateClient(update.message.from);
@@ -2734,6 +2847,12 @@ app.listen(PORT, async () => {
 
   await initStorage();
   console.log('✓ Storage initialized');
+
+  try {
+    await loadAdminGroupChatId();
+  } catch (error) {
+    console.error('❌ Error loading admin group chat:', error);
+  }
 
   if (REMINDER_TICK_MS > 0) {
     setInterval(runBookingReminderTick, REMINDER_TICK_MS);
