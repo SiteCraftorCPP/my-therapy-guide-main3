@@ -471,11 +471,20 @@ async function clientHasFbaTopic(clientId) {
   return !!topic?.topicId;
 }
 
+function buildClientAdminReplyKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '💬 Ответить', callback_data: 'fba_client_reply' }],
+    ],
+  };
+}
+
 async function relayAdminMessageToClient(clientRow, text) {
   await sendMessage(
     Number(clientRow.telegram_id),
     `💬 <b>Сообщение от администратора:</b>\n\n${text}`,
-    getMainMenuKeyboard(Number(clientRow.telegram_id))
+    buildClientAdminReplyKeyboard(),
+    false
   );
 }
 
@@ -1332,6 +1341,15 @@ async function handleTextMessage(message, client) {
     return;
   }
 
+  if (text === '/cancel') {
+    const cancelState = await getState(chatId);
+    if (cancelState?.state === 'waiting_fba_client_reply') {
+      await clearState(chatId);
+      await sendMessage(chatId, 'Отменено.', getMainMenuKeyboard(telegramId));
+      return;
+    }
+  }
+
   if (text === '/cancel' && await canManageGroupBooking(chatId, telegramId)) {
     await clearState(chatId);
     if (message.message_thread_id && isAdminGroupChat(chatId)) {
@@ -1407,6 +1425,19 @@ async function handleTextMessage(message, client) {
 
   // Check current state
   const state = await getState(chatId);
+
+  if (state?.state === 'waiting_fba_client_reply' && text && !text.startsWith('/')) {
+    const relayed = await relayClientMessageToFbaTopic(client, text);
+    if (relayed) {
+      await sendMessage(
+        chatId,
+        '✅ Сообщение отправлено администратору.',
+        buildClientAdminReplyKeyboard(),
+        false
+      );
+      return;
+    }
+  }
 
   if (state?.state === 'waiting_diary') {
     await saveDiaryEntry(client.id, text);
@@ -1500,6 +1531,12 @@ ${text}`;
   ) {
     const relayed = await relayClientMessageToFbaTopic(freshClient, text);
     if (relayed) {
+      await sendMessage(
+        chatId,
+        '✅ Сообщение отправлено администратору.',
+        buildClientAdminReplyKeyboard(),
+        false
+      );
       return;
     }
   }
@@ -1601,6 +1638,17 @@ async function handleCallbackQuery(callbackQuery, client) {
 
   if (data === 'admin_broadcast' && isAdmin(telegramId)) {
     await handleBroadcast(chatId);
+    return;
+  }
+
+  if (data === 'fba_client_reply') {
+    await db.setSetting(`state_${chatId}`, { state: 'waiting_fba_client_reply' });
+    await sendMessage(
+      chatId,
+      '✍️ Напишите ваш ответ администратору — он получит его в чате поддержки.',
+      buildClientAdminReplyKeyboard(),
+      false
+    );
     return;
   }
 
