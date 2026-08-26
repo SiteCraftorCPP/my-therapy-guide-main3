@@ -466,6 +466,19 @@ async function relayClientMessageToFbaTopic(clientRow, text) {
   return true;
 }
 
+async function clientHasFbaTopic(clientId) {
+  const topic = await getFbaTopicForClient(clientId);
+  return !!topic?.topicId;
+}
+
+async function relayAdminMessageToClient(clientRow, text) {
+  await sendMessage(
+    Number(clientRow.telegram_id),
+    `💬 <b>Сообщение от администратора:</b>\n\n${text}`,
+    getMainMenuKeyboard(Number(clientRow.telegram_id))
+  );
+}
+
 async function getOrCreateClient(telegramUser) {
   console.log('🔍 getOrCreateClient called for telegram_id:', telegramUser.id);
   let client = await db.getClientByTelegramId(telegramUser.id);
@@ -1338,36 +1351,24 @@ async function handleTextMessage(message, client) {
 
   if (isAdminGroupChat(chatId) && message.message_thread_id && await canManageGroupBooking(chatId, telegramId)) {
     const threadId = message.message_thread_id;
-    const threadState = await getThreadState(chatId, threadId);
 
-    if (threadState?.state === 'waiting_fba_reply') {
-      const clientUuid = threadState.clientUuid;
-      if (!looksLikeClientUuid(clientUuid)) {
-        await clearThreadState(chatId, threadId);
-        return;
+    if (text && !text.startsWith('/')) {
+      const clientUuid = await getClientUuidByFbaTopic(chatId, threadId);
+      if (looksLikeClientUuid(clientUuid)) {
+        const targetClient = await db.getClientById(clientUuid);
+        if (targetClient) {
+          await relayAdminMessageToClient(targetClient, text);
+          const adminName = message.from.first_name || 'Админ';
+          await sendMessage(
+            chatId,
+            `✅ <b>${adminName}</b>, сообщение отправлено клиенту.`,
+            buildFirstBookingAccessAdminKeyboard(clientUuid),
+            false,
+            threadId
+          );
+          return;
+        }
       }
-      const targetClient = await db.getClientById(clientUuid);
-      if (!targetClient) {
-        await sendMessage(chatId, '❌ Клиент не найден.', null, false, threadId);
-        await clearThreadState(chatId, threadId);
-        return;
-      }
-
-      const adminName = message.from.first_name || 'Админ';
-      await sendMessage(
-        Number(targetClient.telegram_id),
-        `💬 <b>Сообщение от администратора:</b>\n\n${text}`,
-        getMainMenuKeyboard(Number(targetClient.telegram_id))
-      );
-      await sendMessage(
-        chatId,
-        `✅ <b>${adminName}</b>, сообщение отправлено клиенту.`,
-        buildFirstBookingAccessAdminKeyboard(clientUuid),
-        false,
-        threadId
-      );
-      await clearThreadState(chatId, threadId);
-      return;
     }
 
     return;
@@ -1491,19 +1492,14 @@ ${text}`;
 
   const freshClient = await db.getClientByTelegramId(telegramId);
   if (
-    freshClient?.first_booking_access_requested_at &&
-    !freshClient.first_booking_access_approved &&
+    freshClient &&
     text &&
     !text.startsWith('/') &&
-    !menuButtonTexts.has(text)
+    !menuButtonTexts.has(text) &&
+    await clientHasFbaTopic(freshClient.id)
   ) {
     const relayed = await relayClientMessageToFbaTopic(freshClient, text);
     if (relayed) {
-      await sendMessage(
-        chatId,
-        '✉️ Сообщение передано администратору. Ожидайте ответа.',
-        { inline_keyboard: [[{ text: '◀️ Назад', callback_data: 'main_menu' }]] }
-      );
       return;
     }
   }
@@ -1629,15 +1625,9 @@ async function handleCallbackQuery(callbackQuery, client) {
       await sendMessage(chatId, 'Ответить можно только из темы заявки в админ-чате.', null, false);
       return;
     }
-    await setThreadState(chatId, threadId, {
-      state: 'waiting_fba_reply',
-      clientUuid,
-      adminTelegramId: telegramId,
-    });
-    const adminName = callbackQuery.from.first_name || 'Админ';
     await sendMessage(
       chatId,
-      `✍️ <b>${adminName}</b>, напишите сообщение в этой теме — бот перешлёт его клиенту.\n\nДля отмены: /cancel`,
+      '✍️ Telegram/VK, напишите сообщение в этой теме - бот перешлёт его клиенту.',
       null,
       false,
       threadId
